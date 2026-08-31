@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "misza.ai-chat",
+  "name": "AI Chat",
+  "version": "1.0.0",
+  "author": "misza",
+  "license": "MIT",
+  "description": "Chat with any OpenAI-compatible endpoint and local or HTTP MCP servers.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Chat",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "providerId": "ollama",
+      "authMode": "none",
+      "baseUrl": "",
+      "endpointByProvider": "{}",
+      "model": "",
+      "modelByProvider": "{}",
+      "thinkingLevel": "",
+      "mcpPath": "",
+      "mcpEnabled": "[]"
+    }
+  }
+}
