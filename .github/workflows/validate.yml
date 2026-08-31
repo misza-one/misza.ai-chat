@@ -1,0 +1,59 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate plugin shape
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import stat
+          import sys
+
+          with open('manifest.json', encoding='utf-8') as source:
+              manifest = json.load(source)
+
+          errors = []
+          if manifest.get('schemaVersion') != 1:
+              errors.append('schemaVersion must be JSON number 1')
+          if manifest.get('id') != 'misza.ai-chat':
+              errors.append('manifest id must be misza.ai-chat')
+          if 'bar-widget' not in manifest.get('kinds', []):
+              errors.append('kinds must include bar-widget')
+          entry = manifest.get('entryPoints', {}).get('barWidget')
+          if not entry or not os.path.isfile(entry):
+              errors.append('entryPoints.barWidget must point to an existing file')
+          if not os.path.isfile('Panel.qml'):
+              errors.append('Panel.qml is required')
+          bridge = 'bin/ai-chat-bridge'
+          if not os.path.isfile(bridge):
+              errors.append('bin/ai-chat-bridge is required')
+          elif not os.stat(bridge).st_mode & stat.S_IXUSR:
+              errors.append('bin/ai-chat-bridge must be executable')
+
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [item for item in dirs if item != '.git']
+              for name in dirs + files:
+                  path = os.path.join(root, name)
+                  if os.path.islink(path):
+                      errors.append(f'symlink is not allowed: {path}')
+
+          if errors:
+              for error in errors:
+                  print(error, file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Compile bridge
+        run: PYTHONPYCACHEPREFIX=/tmp/opencode-pycache python3 -m py_compile bin/ai-chat-bridge
