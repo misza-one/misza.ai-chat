@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import qs.Commons
 import qs.Ui
 
@@ -12,13 +13,20 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
   readonly property string bridgePath: Qt.resolvedUrl("bin/ai-chat-bridge").toString().replace("file://", "")
+  readonly property string omarchyLogoSource: "file:///usr/share/omarchy/logo.svg"
 
   property bool connected: false
   property bool settingsOpen: false
   property bool advancedOpen: false
   property bool chatSidebarOpen: false
+  property bool chatToolsOpen: false
+  property bool drawerOpen: false
   property bool sending: false
   property string errorText: ""
+  property var errorDebug: null
+  property bool debugOpen: false
+  property bool retryAvailable: false
+  property string retryNotice: ""
   property string activityText: ""
   property string providerId: String(setting("providerId", "ollama"))
   property string authMode: String(setting("authMode", "none"))
@@ -47,11 +55,14 @@ Panel {
   property string assistantTargetText: ""
   property string assistantVisibleText: ""
   property bool assistantDraftStreaming: false
+  readonly property color aiAccent: Color.accent
+  readonly property color userAccent: Color.popups.text
+  readonly property color toolAccent: Color.muted
 
   readonly property string configuredBaseUrl: String(setting("baseUrl", ""))
   readonly property string configuredMcpPath: String(setting("mcpPath", ""))
   readonly property var modelOptions: models.map(function(model) {
-    return { value: model.id, label: model.label }
+    return { value: model.id, label: model.label, description: model.description || "" }
   })
   readonly property var providerOptions: providers.map(function(provider) {
     return { value: provider.id, label: provider.label }
@@ -83,6 +94,7 @@ Panel {
 
   function statusText() {
     if (activityText !== "") return activityText
+    if (retryNotice !== "") return retryNotice
     if (!ready) return connected ? "Changes not loaded" : "Not connected"
     var suffix = models.length === 1 ? " model" : " models"
     var toolCount = activeMcpCount()
@@ -115,25 +127,38 @@ Panel {
     return currentProvider().authStatus || "unknown"
   }
 
+  function providerOAuthKind(provider) {
+    var oauth = (provider && typeof provider.oauth === "object") ? provider.oauth : {}
+    return String(oauth.kind || "")
+  }
+
+  function oauthOptionLabel(provider) {
+    var kind = providerOAuthKind(provider)
+    if (kind === "openrouter") return "Browser API key"
+    if (kind.indexOf("opencode-") === 0) return "OpenCode login"
+    return "Browser login"
+  }
+
   function authOptionsForProvider() {
-    var labels = { none: "Local / no login", key: "API key", oauth: "Use my plan" }
     var provider = currentProvider()
+    var labels = { none: "Local / no login", key: "API key" }
     var modes = provider.authModes || ["key"]
     var out = []
     for (var i = 0; i < modes.length; i++) {
       var mode = String(modes[i])
-      out.push({ value: mode, label: labels[mode] || mode })
+      out.push({ value: mode, label: mode === "oauth" ? oauthOptionLabel(provider) : (labels[mode] || mode) })
     }
     return out
   }
 
   function authModeLabel() {
-    var labels = { none: "Local", key: "API key", oauth: "Plan login" }
+    var labels = { none: "Local", key: "API key", oauth: oauthOptionLabel(currentProvider()) }
     return labels[authMode] || authMode
   }
 
   function authModeDescription(mode) {
-    if (mode === "oauth") return "Use your provider subscription when available"
+    if (mode === "oauth" && providerOAuthKind(currentProvider()) === "openrouter") return "Create an OpenRouter API key in the browser and save it in the keyring"
+    if (mode === "oauth") return "Use a supported browser login when available"
     if (mode === "key") return "Use a token saved in the system keyring"
     if (mode === "none") return "Use a local OpenAI-compatible endpoint"
     return String(mode)
@@ -308,24 +333,31 @@ Panel {
     var status = currentProviderAuthStatus()
     if (authMode === "none") return "No login needed"
     if (authMode === "oauth") {
-      if (status.indexOf("signed in") >= 0 || status.indexOf("saved") >= 0) return "Plan connected"
+      if (providerOAuthKind(currentProvider()) === "openrouter")
+        return status.indexOf("saved") >= 0 ? "API key saved" : "API key missing"
+      if (status.indexOf("signed in") >= 0 || status.indexOf("saved") >= 0) return "Login connected"
       return "Not logged in"
     }
     if (authMode === "key") {
-      if (status.indexOf("API key saved") >= 0 || status.indexOf("OAuth key saved") >= 0) return "API key saved"
+      if (status.indexOf("API key saved") >= 0 || status.indexOf("Browser key saved") >= 0) return "API key saved"
       return "API key missing"
     }
     return status
   }
 
+  function authReady() {
+    var status = methodStatusText()
+    return status === "Login connected" || status === "API key saved" || status === "No login needed"
+  }
+
   function mainActionText() {
-    if (authMode === "oauth") return methodStatusText() === "Plan connected" ? (ready ? "Reload models" : "Load models") : "Sign in"
+    if (authMode === "oauth") return authReady() ? (ready ? "Reload models" : "Load models") : (providerOAuthKind(currentProvider()) === "openrouter" ? "Create key" : "Sign in")
     if (authMode === "key") return methodStatusText() === "API key saved" ? (ready ? "Reload models" : "Load models") : "Save key first"
     return ready ? "Reconnect" : "Connect"
   }
 
   function runMainAction() {
-    if (authMode === "oauth" && methodStatusText() !== "Plan connected") startOAuth()
+    if (authMode === "oauth" && !authReady()) startOAuth()
     else connect()
   }
 
@@ -336,7 +368,7 @@ Panel {
 
   function providerRowDescription(provider) {
     var status = provider.authStatus || "unknown"
-    var mode = provider.defaultAuthMode === "oauth" ? "OAuth login" : (provider.defaultAuthMode === "none" ? "No auth" : "API key")
+    var mode = provider.defaultAuthMode === "oauth" ? oauthOptionLabel(provider) : (provider.defaultAuthMode === "none" ? "No auth" : "API key")
     var endpoint = provider.id === providerId ? endpointDraft.trim() : effectiveEndpointForProvider(provider.id)
     return mode + " / " + status + (endpoint ? " / " + endpoint : "")
   }
@@ -390,12 +422,12 @@ Panel {
   function oauthDescription() {
     var kind = providerOAuth().kind || ""
     if (kind === "opencode-openai")
-      return "Uses the same ChatGPT Pro/Plus browser OAuth as OpenCode. The browser redirects to localhost:1455 and the token is saved for OpenCode and this widget."
+      return "Uses an OpenCode-compatible OpenAI browser login. The token is saved for OpenCode and this widget."
     if (kind === "opencode-xai")
-      return "Uses the same SuperGrok OAuth device login as OpenCode. The browser opens xAI login and the returned token is saved for OpenCode and this widget."
+      return "Uses an OpenCode-compatible xAI browser login. The returned token is saved for OpenCode and this widget."
     if (kind === "openrouter")
-      return "Uses OpenRouter PKCE login. The browser redirects to localhost and the returned user-controlled API key is saved in the keyring."
-    return "This provider does not expose a built-in OAuth login flow here. Use API key mode."
+      return "Opens OpenRouter in the browser to create a user-controlled API key, then saves that key in the system keyring."
+    return "This provider does not expose a built-in browser auth flow here. Use API key mode."
   }
 
   function connect() {
@@ -408,7 +440,7 @@ Panel {
     var modelStore = modelStoreWith(selectedModel)
     modelByProvider = modelStore
     activityText = "Connecting " + currentProviderLabel() + "..."
-    errorText = ""
+    clearErrorState()
     persistSettings({ providerId: providerId, authMode: authMode, baseUrl: baseUrl,
       endpointByProvider: JSON.stringify(endpointStore), model: selectedModel,
       modelByProvider: JSON.stringify(modelStore), thinkingLevel: thinkingLevel,
@@ -424,7 +456,7 @@ Panel {
     endpointDraft = baseUrl
     var endpointStore = persistEndpointForProvider(providerId, baseUrl)
     activityText = "Saving API key..."
-    errorText = ""
+    clearErrorState()
     persistSettings({ providerId: providerId, authMode: authMode, baseUrl: baseUrl,
       endpointByProvider: JSON.stringify(endpointStore) })
     bridge.send({ op: "saveKey", baseUrl: baseUrl, key: key })
@@ -440,7 +472,7 @@ Panel {
     endpointDraft = baseUrl
     var endpointStore = persistEndpointForProvider(providerId, baseUrl)
     activityText = "Opening " + currentProviderLabel() + " login..."
-    errorText = ""
+    clearErrorState()
     persistSettings({ providerId: providerId, authMode: "oauth", baseUrl: baseUrl,
       endpointByProvider: JSON.stringify(endpointStore) })
     bridge.send({ op: "startOAuth", providerId: providerId, baseUrl: baseUrl })
@@ -464,6 +496,23 @@ Panel {
     else next.push(key)
     enabledMcpKeys = next
     persistSettings({ mcpEnabled: JSON.stringify(enabledMcpKeys) })
+  }
+
+  function canShowChatTools() {
+    return allMcpServers.length > 0 || enabledMcpKeys.length > 0
+  }
+
+  function toolsPending() {
+    return connected && activeMcpEnabled !== JSON.stringify(enabledMcpKeys)
+  }
+
+  function toolsButtonText() {
+    return enabledMcpKeys.length > 0 ? "Tools " + enabledMcpKeys.length : "Tools"
+  }
+
+  function toolsSummaryText() {
+    return enabledMcpKeys.length + " selected / " + activeMcpCount() + " connected / "
+      + allMcpServers.length + " found" + (toolsPending() ? " / reload to apply" : "")
   }
 
   function mcpStatus(key) {
@@ -503,10 +552,30 @@ Panel {
     return { source: source, label: attachmentLabel(source), kind: attachmentKind(source) }
   }
 
-  function addAttachment() {
-    var source = attachmentField.text.trim()
+  function filePathFromUrl(url) {
+    var text = String(url || "")
+    if (text.indexOf("file://") === 0) text = decodeURIComponent(text.replace(/^file:\/\//, ""))
+    return text
+  }
+
+  function addAttachmentSource(source) {
+    source = String(source || "").trim()
     if (source === "") return
     attachments = attachments.concat([attachmentFromSource(source)])
+  }
+
+  function addAttachmentUrls(urls) {
+    for (var i = 0; i < urls.length; i++) addAttachmentSource(filePathFromUrl(urls[i]))
+  }
+
+  function addAttachment() {
+    var source = attachmentField.text.trim()
+    if (source === "") {
+      activityText = "Opening file picker..."
+      bridge.send({ op: "pickFiles" })
+      return
+    }
+    addAttachmentSource(source)
     attachmentField.text = ""
   }
 
@@ -522,8 +591,153 @@ Panel {
     return copy
   }
 
+  function roleColor(role, status) {
+    if (role === "You") return root.userAccent
+    if (role === "AI") return root.aiAccent
+    if (role === "Tool") return status === "error" ? Color.urgent : root.toolAccent
+    return Color.popups.text
+  }
+
+  function roleFill(role) {
+    if (role === "You") return Style.normalFillFor(Color.popups.text, Color.accent)
+    if (role === "AI") return Style.selectedFillFor(Color.popups.text, Color.accent)
+    if (role === "Tool") return Style.normalFillFor(root.toolAccent, Color.accent)
+    return Style.normalFillFor(Color.popups.text, Color.accent)
+  }
+
+  function roleBorder(role, status) {
+    if (role === "You") return Style.normalBorderFor(Color.popups.text, Color.accent)
+    if (role === "AI") return Style.selectedBorderFor(Color.popups.text, Color.accent)
+    if (role === "Tool") return Style.normalBorderFor(status === "error" ? Color.urgent : root.toolAccent, Color.accent)
+    return Style.normalBorderFor(Color.popups.text, Color.accent)
+  }
+
+  function messageTextColor(role, status) {
+    if (role === "Tool") return status === "error" ? Color.urgent : root.toolAccent
+    return Color.popups.text
+  }
+
+  function hasDebugDetails() {
+    return errorDebug && typeof errorDebug === "object" && Object.keys(errorDebug).length > 0
+  }
+
+  function debugDetailsText() {
+    if (!hasDebugDetails()) return ""
+    try { return JSON.stringify(errorDebug, null, 2) } catch (e) { return String(errorDebug) }
+  }
+
+  function clearErrorState() {
+    errorText = ""
+    errorDebug = null
+    debugOpen = false
+    retryAvailable = false
+    retryNotice = ""
+  }
+
+  function splitTableRow(line) {
+    var text = String(line || "").trim()
+    if (text.charAt(0) === "|") text = text.slice(1)
+    if (text.charAt(text.length - 1) === "|") text = text.slice(0, -1)
+    var cells = text.split("|")
+    for (var i = 0; i < cells.length; i++) cells[i] = cells[i].trim()
+    return cells
+  }
+
+  function isTableSeparator(line) {
+    if (String(line || "").indexOf("|") < 0) return false
+    var cells = splitTableRow(line)
+    if (cells.length < 2) return false
+    for (var i = 0; i < cells.length; i++) {
+      if (!cells[i].match(/^:?-{3,}:?$/)) return false
+    }
+    return true
+  }
+
+  function looksLikeTableRow(line) {
+    return String(line || "").indexOf("|") >= 0 && splitTableRow(line).length >= 2
+  }
+
+  function normalizedTableRow(cells, count) {
+    var row = []
+    for (var i = 0; i < count; i++) row.push(i < cells.length ? String(cells[i]) : "")
+    return row
+  }
+
+  function messageText(message, modelIndex) {
+    if (modelIndex === assistantDraftIndex && message && message.role === "AI")
+      return assistantVisibleText + (assistantDraftIndex >= 0 ? " |" : "")
+    return String((message && message.text) || "") + (message && message.streaming ? " |" : "")
+  }
+
+  function messageBlocks(message, modelIndex) {
+    var role = String((message && message.role) || "")
+    var text = messageText(message, modelIndex)
+    if (role !== "AI") return text === "" ? [] : [{ kind: "text", text: text }]
+
+    var lines = text.split("\n")
+    var blocks = []
+    var buffer = []
+    var inFence = false
+    var i = 0
+    while (i < lines.length) {
+      if (lines[i].match(/^\s*```/)) {
+        inFence = !inFence
+        buffer.push(lines[i])
+        i += 1
+        continue
+      }
+      if (!inFence && i + 1 < lines.length && looksLikeTableRow(lines[i]) && isTableSeparator(lines[i + 1])) {
+        if (buffer.length > 0) {
+          blocks.push({ kind: "text", text: buffer.join("\n") })
+          buffer = []
+        }
+        var header = splitTableRow(lines[i])
+        var columnCount = header.length
+        var rows = []
+        i += 2
+        while (i < lines.length && looksLikeTableRow(lines[i])) {
+          rows.push(normalizedTableRow(splitTableRow(lines[i]), columnCount))
+          i += 1
+        }
+        blocks.push({ kind: "table", header: normalizedTableRow(header, columnCount), rows: rows, columnCount: columnCount })
+        continue
+      }
+      buffer.push(lines[i])
+      i += 1
+    }
+    if (buffer.length > 0) blocks.push({ kind: "text", text: buffer.join("\n") })
+    return blocks
+  }
+
+  function tableDisplayRows(table) {
+    var rows = [{ header: true, cells: table.header || [] }]
+    for (var i = 0; i < (table.rows || []).length; i++) rows.push({ header: false, cells: table.rows[i] })
+    return rows
+  }
+
+  function tableColumnWidth(table, column) {
+    var maxChars = String((table.header || [])[column] || "").length
+    var rows = table.rows || []
+    for (var i = 0; i < rows.length; i++) maxChars = Math.max(maxChars, String((rows[i] || [])[column] || "").length)
+    return Math.max(Style.space(82), Math.min(Style.space(260), Math.round(maxChars * Style.font.body * 0.58) + Style.space(22)))
+  }
+
+  function tableWidth(table) {
+    var total = 0
+    for (var i = 0; i < (table.columnCount || 0); i++) total += tableColumnWidth(table, i)
+    return total
+  }
+
+  function toolSummary(message, expanded) {
+    var text = String((message && message.text) || "")
+    var name = text.split(" -> ")[0]
+    var status = String((message && message.status) || "ok")
+    return (status === "error" ? "Tool error" : "Tool call") + (name ? ": " + name : "") + (expanded ? " / click to collapse" : " / click to expand")
+  }
+
   function updateAssistantDraft(text, streaming) {
     if (assistantDraftIndex < 0 || assistantDraftIndex >= messages.length) return
+    if (streaming) return
     var next = messages.slice()
     var message = copyMessage(next[assistantDraftIndex])
     message.text = text
@@ -552,6 +766,19 @@ Panel {
     assistantDraftStreaming = false
   }
 
+  function discardAssistantDraft() {
+    assistantAnimation.stop()
+    if (assistantDraftIndex >= 0 && assistantDraftIndex < messages.length) {
+      var next = messages.slice()
+      next.splice(assistantDraftIndex, 1)
+      messages = next
+    }
+    assistantDraftIndex = -1
+    assistantTargetText = ""
+    assistantVisibleText = ""
+    assistantDraftStreaming = false
+  }
+
   function queueAssistantText(text) {
     if (text === "") return
     ensureAssistantDraft()
@@ -565,7 +792,6 @@ Panel {
     if (!streamed || assistantTargetText === "") {
       assistantTargetText = text
       assistantVisibleText = ""
-      updateAssistantDraft("", true)
     } else if (text.length > assistantTargetText.length) {
       assistantTargetText = text
     }
@@ -582,8 +808,27 @@ Panel {
     attachments = []
     messages = messages.concat([{ role: "You", text: prompt, attachments: outgoingAttachments }])
     sending = true
-    errorText = ""
+    clearErrorState()
+    Qt.callLater(function() { transcript.positionViewAtEnd() })
     bridge.send({ op: "chat", prompt: prompt, thinkingLevel: thinkingLevel, attachments: outgoingAttachments })
+  }
+
+  function retryLastMessage() {
+    if (!retryAvailable || sending || !ready || selectedModel === "") return
+    discardAssistantDraft()
+    sending = true
+    errorText = ""
+    errorDebug = null
+    debugOpen = false
+    retryNotice = "Retrying..."
+    Qt.callLater(function() { transcript.positionViewAtEnd() })
+    bridge.send({ op: "retry", thinkingLevel: thinkingLevel })
+  }
+
+  function stopResponse() {
+    if (!sending) return
+    activityText = "Stopping..."
+    bridge.send({ op: "stop" })
   }
 
   function clearChat() {
@@ -591,11 +836,12 @@ Panel {
     messages = []
     attachments = []
     currentChatId = ""
-    errorText = ""
+    clearErrorState()
     bridge.send({ op: "reset" })
   }
 
   function loadChat(id) {
+    if (sending) stopResponse()
     completeAssistantAnimation()
     bridge.send({ op: "loadChat", id: id })
     settingsOpen = false
@@ -642,8 +888,16 @@ Panel {
   }
 
   function open() {
+    var wasOpen = opened
+    drawerCloseTimer.stop()
     controller.show()
     settingsOpen = false
+    if (!wasOpen) {
+      drawerOpen = false
+      Qt.callLater(function() { if (root.opened) root.drawerOpen = true })
+    } else {
+      drawerOpen = true
+    }
     var startupEndpoint = configuredBaseUrl || effectiveEndpointForProvider(providerId)
     if (startupEndpoint !== "") {
       endpointDraft = startupEndpoint
@@ -659,7 +913,11 @@ Panel {
     }
   }
 
-  function close() { controller.hide() }
+  function close() {
+    if (!opened) return
+    drawerOpen = false
+    drawerCloseTimer.restart()
+  }
   function toggle() { opened ? close() : open() }
   function closeForPopoutSwitch() { close() }
   function switchPanel(direction) {
@@ -683,6 +941,10 @@ Panel {
       root.activeBaseUrl = ""
       root.activeMcpEnabled = ""
       root.sending = false
+      root.errorDebug = null
+      root.debugOpen = false
+      root.retryAvailable = false
+      root.retryNotice = ""
       root.errorText = message
     }
     onLine: function(value) {
@@ -725,15 +987,35 @@ Panel {
           model: root.selectedModel,
           modelByProvider: JSON.stringify(modelStore), thinkingLevel: root.thinkingLevel,
           mcpPath: mcpPathField.text.trim(), mcpEnabled: JSON.stringify(root.enabledMcpKeys) })
-        root.errorText = ""
+        root.clearErrorState()
       } else if (event.type === "chat") {
         root.sending = false
         root.activityText = ""
+        root.clearErrorState()
         root.currentChatId = event.chatId || root.currentChatId
         root.finishAssistantText(event.text || "The model finished without text.", Boolean(event.streamed))
       } else if (event.type === "chatDelta") {
         root.currentChatId = event.chatId || root.currentChatId
+        root.retryNotice = ""
         root.queueAssistantText(event.text || "")
+      } else if (event.type === "chatRetry") {
+        var attempt = Number(event.attempt || 0)
+        var maxAttempts = Number(event.maxAttempts || 0)
+        var delay = Number(event.delay || 0)
+        root.activityText = ""
+        root.retryNotice = "Retrying in " + delay.toFixed(delay >= 10 ? 0 : 1) + "s"
+          + (attempt > 0 && maxAttempts > 0 ? " (attempt " + attempt + " of " + maxAttempts + ")" : "")
+        root.errorDebug = event.debug || null
+        root.debugOpen = false
+      } else if (event.type === "chatStopped") {
+        root.sending = false
+        root.activityText = ""
+        root.retryNotice = ""
+        root.discardAssistantDraft()
+        root.errorText = "Stopped."
+        root.errorDebug = null
+        root.debugOpen = false
+        root.retryAvailable = root.ready && root.messages.length > 0
       } else if (event.type === "toolCall") {
         root.messages = root.messages.concat([{ role: "Tool", text: event.text || event.name, status: event.status || "ok" }])
         Qt.callLater(function() { transcript.positionViewAtEnd() })
@@ -744,31 +1026,52 @@ Panel {
         root.completeAssistantAnimation()
         root.currentChatId = event.chatId || ""
         root.messages = event.messages || []
-        root.errorText = ""
+        root.clearErrorState()
         Qt.callLater(function() { transcript.positionViewAtEnd() })
       } else if (event.type === "chatReset") {
         root.completeAssistantAnimation()
         root.currentChatId = ""
         root.messages = []
         root.attachments = []
+        root.clearErrorState()
       } else if (event.type === "keySaved") {
         root.activityText = ""
+        root.errorDebug = null
+        root.debugOpen = false
+        root.retryAvailable = false
+        root.retryNotice = ""
         root.errorText = "API key saved in the system keyring."
         bridge.send({ op: "discover" })
       } else if (event.type === "oauthStarted") {
         root.activityText = "Waiting for OAuth callback..."
+        root.errorDebug = null
+        root.debugOpen = false
+        root.retryAvailable = false
+        root.retryNotice = ""
         root.errorText = event.message || ("OAuth opened in the browser. Waiting for callback on " + event.redirectUri + ".")
       } else if (event.type === "oauthSaved") {
-        root.errorText = "OAuth login saved. Connecting..."
+        root.errorDebug = null
+        root.debugOpen = false
+        root.retryAvailable = false
+        root.retryNotice = ""
+        root.errorText = root.providerOAuthKind(root.currentProvider()) === "openrouter" ? "API key saved. Connecting..." : "Login saved. Connecting..."
         bridge.send({ op: "discover" })
         root.connect()
       } else if (event.type === "notice") {
         root.activityText = ""
+        root.errorDebug = null
+        root.debugOpen = false
+        root.retryAvailable = false
+        root.retryNotice = ""
         root.errorText = event.message || ""
+      } else if (event.type === "filesPicked") {
+        root.activityText = ""
+        root.addAttachmentUrls(event.files || [])
       } else if (event.type === "error") {
         root.sending = false
-        root.completeAssistantAnimation()
-        if (event.op !== "chat" && event.op !== "renameChat" && event.op !== "deleteChat" && event.op !== "reset") {
+        if (event.op === "chat" || event.op === "retry") root.discardAssistantDraft()
+        else root.completeAssistantAnimation()
+        if (event.op !== "chat" && event.op !== "retry" && event.op !== "pickFiles" && event.op !== "renameChat" && event.op !== "deleteChat" && event.op !== "reset") {
           root.connected = false
           root.activeProviderId = ""
           root.activeAuthMode = ""
@@ -776,10 +1079,20 @@ Panel {
           root.activeMcpEnabled = ""
         }
         root.activityText = ""
+        root.retryNotice = ""
+        root.errorDebug = event.debug || null
+        root.debugOpen = false
+        root.retryAvailable = (event.op === "chat" || event.op === "retry") && root.ready && root.messages.length > 0
         root.errorText = event.message || "The AI bridge failed."
       }
     }
     Component.onCompleted: bridge.start()
+  }
+
+  Timer {
+    id: drawerCloseTimer
+    interval: 170
+    onTriggered: root.controller.hide()
   }
 
   Timer {
@@ -802,22 +1115,44 @@ Panel {
       root.assistantVisibleText += root.assistantTargetText.slice(root.assistantVisibleText.length,
         root.assistantVisibleText.length + step)
       root.updateAssistantDraft(root.assistantVisibleText, root.assistantDraftStreaming || root.assistantVisibleText.length < root.assistantTargetText.length)
+      Qt.callLater(function() { transcript.positionViewAtEnd() })
     }
   }
 
-  KeyboardPanel {
+  FloatingWindow {
     id: panel
-    anchorItem: root.anchorItem
-    owner: root.barIdentity
-    bar: root.bar
-    open: root.opened
-    focusTarget: root.settingsOpen ? providerPicker : input
-    contentWidth: panel.fittedContentWidth(Style.space(860))
-    contentHeight: panel.fittedContentHeight(Style.space(720))
+    title: "Omarchy AI Chat"
+    visible: root.opened || root.drawerOpen
+    color: Color.popups.background
+    implicitWidth: Style.space(900)
+    implicitHeight: Style.space(740)
+    minimumSize: Qt.size(Style.space(620), Style.space(500))
 
-    Column {
-      anchors.fill: parent
-      spacing: Style.space(10)
+    onVisibleChanged: {
+      if (!visible && root.opened) {
+        root.drawerOpen = false
+        root.controller.hide()
+      }
+      if (visible) {
+        Qt.callLater(function() { (root.settingsOpen ? providerPicker : input).forceActiveFocus() })
+      }
+    }
+
+    FocusScope {
+      id: drawerContent
+      x: Style.space(18)
+      y: Style.space(18) + (root.drawerOpen ? 0 : Math.min(Style.space(96), panel.height * 0.18))
+      width: panel.width - Style.space(36)
+      height: panel.height - Style.space(36)
+      opacity: root.drawerOpen ? 1.0 : 0.0
+      focus: true
+
+      Behavior on y { NumberAnimation { duration: 170; easing.type: Easing.OutCubic } }
+      Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+
+      Column {
+        anchors.fill: parent
+        spacing: Style.space(10)
 
       Row {
         id: headerRow
@@ -1237,27 +1572,19 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
               }
-              Dropdown {
+              AdaptiveSearchableDropdown {
                 id: setupModelPicker
                 width: parent.width
                 visible: root.ready
                 label: "Active model"
                 value: root.selectedModel
                 options: root.modelOptions
+                placeholderText: "Filter models..."
+                emptyText: "No matching models"
                 enabled: !root.sending
                 onChanged: function(value) {
                   root.setSelectedModel(value, true)
                 }
-              }
-              Dropdown {
-                id: setupThinkingPicker
-                width: parent.width
-                visible: root.ready && root.thinkingModeOptions.length > 0
-                label: "Thinking"
-                value: root.thinkingLevel
-                options: root.thinkingModeOptions
-                enabled: !root.sending
-                onChanged: function(value) { root.setThinkingLevel(value) }
               }
               Text {
                 width: parent.width
@@ -1312,7 +1639,11 @@ Panel {
               }
               Button {
                 id: closeSidebarButton
-                text: "Close"
+                width: Style.space(32)
+                text: ""
+                iconText: "X"
+                iconSize: Style.font.body
+                tooltipText: "Close chats"
                 bordered: true
                 onClicked: root.chatSidebarOpen = false
               }
@@ -1386,12 +1717,39 @@ Panel {
                           font.bold: true
                           elide: Text.ElideRight
                         }
-                        TextField {
+                        Row {
                           width: parent.width
                           visible: root.renamingChatId === modelData.id
-                          text: root.renameDraft
-                          onTextChanged: if (visible) root.renameDraft = text
-                          onAccepted: root.renameChat(modelData.id, text)
+                          spacing: Style.space(5)
+                          TextField {
+                            width: parent.width - renameSaveButton.width - renameCancelButton.width - parent.spacing * 2
+                            text: root.renameDraft
+                            onTextChanged: if (visible) root.renameDraft = text
+                            onAccepted: root.renameChat(modelData.id, text)
+                          }
+                          Button {
+                            id: renameSaveButton
+                            width: Style.space(30)
+                            text: ""
+                            iconText: "✓"
+                            iconSize: Style.font.body
+                            tooltipText: "Save title"
+                            selected: true
+                            enabled: root.renameDraft.trim() !== ""
+                            horizontalPadding: Style.space(5)
+                            onClicked: root.renameChat(modelData.id, root.renameDraft)
+                          }
+                          Button {
+                            id: renameCancelButton
+                            width: Style.space(30)
+                            text: ""
+                            iconText: "X"
+                            iconSize: Style.font.body
+                            tooltipText: "Cancel"
+                            bordered: true
+                            horizontalPadding: Style.space(5)
+                            onClicked: root.cancelRenameChat()
+                          }
                         }
                         Text {
                           width: parent.width
@@ -1402,39 +1760,40 @@ Panel {
                           font.pixelSize: Style.font.caption
                           elide: Text.ElideRight
                         }
-                        Flow {
+                        Row {
                           width: parent.width
+                          visible: root.renamingChatId !== modelData.id
                           spacing: Style.space(6)
                           Button {
+                            width: parent.width - renameChatButton.width - deleteChatButton.width - parent.spacing * 2
                             text: "Load"
                             bordered: true
-                            visible: root.renamingChatId !== modelData.id
+                            leftAlign: true
                             onClicked: root.loadChat(modelData.id)
                           }
                           Button {
-                            text: "Rename"
+                            id: renameChatButton
+                            width: Style.space(30)
+                            text: ""
+                            iconText: "✎"
+                            iconSize: Style.font.body
+                            tooltipText: "Rename"
                             bordered: true
-                            visible: root.renamingChatId !== modelData.id
+                            horizontalPadding: Style.space(5)
                             onClicked: root.startRenameChat(modelData.id, modelData.title)
                           }
                           Button {
-                            text: "Delete"
+                            id: deleteChatButton
+                            width: Style.space(30)
+                            text: ""
+                            iconText: "X"
+                            iconSize: Style.font.body
+                            tooltipText: "Delete"
+                            foreground: Color.urgent
+                            accent: Color.urgent
                             bordered: true
-                            visible: root.renamingChatId !== modelData.id
+                            horizontalPadding: Style.space(5)
                             onClicked: root.deleteChat(modelData.id)
-                          }
-                          Button {
-                            text: "Save"
-                            selected: true
-                            visible: root.renamingChatId === modelData.id
-                            enabled: root.renameDraft.trim() !== ""
-                            onClicked: root.renameChat(modelData.id, root.renameDraft)
-                          }
-                          Button {
-                            text: "Cancel"
-                            bordered: true
-                            visible: root.renamingChatId === modelData.id
-                            onClicked: root.cancelRenameChat()
                           }
                         }
                       }
@@ -1457,13 +1816,17 @@ Panel {
             width: parent.width
             visible: root.ready
             spacing: Style.space(8)
-            Dropdown {
+            AdaptiveSearchableDropdown {
               id: modelPicker
-              width: thinkingPicker.visible ? parent.width - thinkingPicker.width - parent.spacing : parent.width
+              width: Math.max(Style.space(170), parent.width
+                - (thinkingPicker.visible ? thinkingPicker.width + parent.spacing : 0)
+                - (toolsToggleButton.visible ? toolsToggleButton.width + parent.spacing : 0))
               label: "Model"
               showLabel: false
               value: root.selectedModel
               options: root.modelOptions
+              placeholderText: "Filter models..."
+              emptyText: "No matching models"
               enabled: root.ready && !root.sending
               onChanged: function(value) { root.setSelectedModel(value, true) }
             }
@@ -1477,6 +1840,96 @@ Panel {
               options: root.thinkingModeOptions
               enabled: root.ready && !root.sending
               onChanged: function(value) { root.setThinkingLevel(value) }
+            }
+            Button {
+              id: toolsToggleButton
+              text: root.toolsButtonText()
+              bordered: !root.chatToolsOpen
+              selected: root.chatToolsOpen
+              visible: root.canShowChatTools()
+              enabled: !root.sending
+              tooltipText: root.toolsSummaryText()
+              onClicked: {
+                root.chatToolsOpen = !root.chatToolsOpen
+                if (root.chatToolsOpen) bridge.send({ op: "discover" })
+              }
+            }
+          }
+
+          Rectangle {
+            id: chatToolsPanel
+            width: parent.width
+            height: visible ? chatToolsContent.implicitHeight + Style.space(14) : 0
+            visible: root.chatToolsOpen && root.canShowChatTools()
+            radius: Style.cornerRadius
+            color: Style.selectedFillFor(Color.popups.text, Color.accent)
+            border.color: Style.normalBorderFor(Color.popups.text, Color.accent)
+            border.width: 1
+            clip: true
+
+            Column {
+              id: chatToolsContent
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(7)
+              spacing: Style.space(7)
+
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+                Text {
+                  width: Math.max(Style.space(120), parent.width - toolsRescanButton.width
+                    - (toolsApplyButton.visible ? toolsApplyButton.width + parent.spacing : 0)
+                    - parent.spacing)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.toolsSummaryText()
+                  textFormat: Text.PlainText
+                  color: root.toolsPending() ? Color.accent : Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: root.toolsPending()
+                  elide: Text.ElideRight
+                }
+                Button {
+                  id: toolsRescanButton
+                  text: "Rescan"
+                  bordered: true
+                  onClicked: bridge.send({ op: "discover" })
+                }
+                Button {
+                  id: toolsApplyButton
+                  text: "Apply"
+                  selected: true
+                  visible: root.toolsPending()
+                  enabled: !root.sending
+                  tooltipText: "Reload models with selected tools"
+                  onClicked: root.connect()
+                }
+              }
+
+              Text {
+                width: parent.width
+                visible: root.allMcpServers.length === 0
+                text: "No tools found yet. Rescan checks known MCP config locations."
+                textFormat: Text.PlainText
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Repeater {
+                model: root.allMcpServers
+                delegate: Toggle {
+                  width: chatToolsContent.width
+                  label: String(modelData.name || modelData.key || "Tool")
+                  description: String(modelData.source || "MCP") + " / " + root.mcpStatus(String(modelData.key || ""))
+                  checked: root.isMcpEnabled(String(modelData.key || ""))
+                  foreground: Color.popups.text
+                  onClicked: root.toggleMcp(String(modelData.key || ""))
+                }
+              }
             }
           }
 
@@ -1492,31 +1945,96 @@ Panel {
                 width: chipText.implicitWidth + Style.space(16)
                 height: Style.space(24)
                 radius: Style.cornerRadius
-                color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)
+                color: Util.alpha(Color.accent, 0.14)
+                border.color: Util.alpha(Color.accent, 0.28)
+                border.width: 1
                 Text {
                   id: chipText
                   anchors.centerIn: parent
                   text: modelData
                   textFormat: Text.PlainText
-                  color: Color.muted
+                  color: Color.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
+                  font.bold: true
                 }
               }
             }
           }
 
-          Text {
-            id: messageLine
+          Column {
+            id: noticeArea
             width: parent.width
-            visible: root.errorText !== "" || !root.ready
-            text: root.errorText !== "" ? root.errorText : "Open Setup and load models before chatting."
-            textFormat: Text.PlainText
-            color: root.errorText.indexOf("saved") !== -1 || root.errorText.indexOf("Opened") !== -1
-              ? Color.accent : (root.errorText !== "" ? Color.urgent : Color.muted)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            visible: root.errorText !== "" || root.retryNotice !== "" || !root.ready
+            spacing: Style.space(6)
+
+            Text {
+              id: messageLine
+              width: parent.width
+              text: root.retryNotice !== "" ? root.retryNotice
+                : (root.errorText !== "" ? root.errorText : "Open Setup and load models before chatting.")
+              textFormat: Text.PlainText
+              color: root.retryNotice !== "" || root.errorText.indexOf("saved") !== -1 || root.errorText.indexOf("Opened") !== -1
+                ? Color.accent : (root.errorText !== "" ? Color.urgent : Color.muted)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              width: parent.width
+              visible: root.errorText !== "" && (root.retryAvailable || root.hasDebugDetails())
+              spacing: Style.space(8)
+
+              Button {
+                text: "Retry"
+                selected: true
+                visible: root.retryAvailable
+                enabled: root.ready && !root.sending
+                onClicked: root.retryLastMessage()
+              }
+
+              Button {
+                text: root.debugOpen ? "Hide debug" : "Show debug"
+                bordered: true
+                visible: root.hasDebugDetails()
+                onClicked: root.debugOpen = !root.debugOpen
+              }
+            }
+
+            Rectangle {
+              id: debugPanel
+              width: parent.width
+              height: visible ? Math.min(Style.space(190), debugText.implicitHeight + Style.space(14)) : 0
+              visible: root.debugOpen && root.hasDebugDetails()
+              radius: Style.cornerRadius
+              color: Style.normalFillFor(Color.popups.text, Color.accent)
+              border.color: Style.normalBorderFor(Color.popups.text, Color.accent)
+              border.width: 1
+              clip: true
+
+              Flickable {
+                anchors.fill: parent
+                anchors.margins: Style.space(7)
+                contentWidth: width
+                contentHeight: debugText.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                ScrollBar.vertical: ScrollBar { policy: debugText.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff }
+
+                Text {
+                  id: debugText
+                  width: parent.width
+                  text: root.debugDetailsText()
+                  textFormat: Text.PlainText
+                  color: Color.muted
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WrapAnywhere
+                }
+              }
+            }
           }
 
           Rectangle {
@@ -1524,10 +2042,11 @@ Panel {
             width: parent.width
             height: Math.max(Style.space(260), parent.height
               - (chatControlRow.visible ? chatControlRow.height + parent.spacing : 0)
+              - (chatToolsPanel.visible ? chatToolsPanel.height + parent.spacing : 0)
               - (capabilityFlow.visible ? capabilityFlow.height + parent.spacing : 0)
-              - (messageLine.visible ? messageLine.height + parent.spacing : 0)
+              - (noticeArea.visible ? noticeArea.height + parent.spacing : 0)
               - composer.height - Style.space(16))
-            color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.06)
+            color: Style.normalFillFor(Color.popups.text, Color.accent)
             radius: Style.cornerRadius
             clip: true
 
@@ -1538,38 +2057,294 @@ Panel {
               model: root.messages
               spacing: Style.space(12)
               clip: true
-              delegate: Column {
+              delegate: Rectangle {
+                id: messageCard
+                property var messageData: modelData
+                property string messageRole: String(modelData.role || "")
+                property bool isTool: messageRole === "Tool"
+                property bool toolExpanded: false
+                property int messageIndex: index
                 width: transcript.width
-                spacing: Style.space(3)
-                Text {
-                  text: modelData.role
-                  color: modelData.role === "You" ? Color.accent
-                    : (modelData.role === "Tool" ? Color.muted : Color.foreground)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-                Repeater {
-                  model: modelData.attachments || []
-                  delegate: Text {
+                height: messageContent.implicitHeight + Style.space(14)
+                radius: Style.cornerRadius
+                color: root.roleFill(messageRole)
+                border.color: root.roleBorder(messageRole, String(modelData.status || ""))
+                border.width: 1
+
+                Column {
+                  id: messageContent
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  anchors.margins: Style.space(7)
+                  spacing: Style.space(5)
+
+                  Row {
                     width: parent.width
-                    text: "[" + modelData.kind + "] " + modelData.label
-                    textFormat: Text.PlainText
-                    color: Color.muted
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
+                    spacing: Style.space(8)
+                    Text {
+                      id: roleName
+                      text: messageCard.messageRole
+                      color: root.roleColor(messageCard.messageRole, String(messageCard.messageData.status || ""))
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      width: Math.max(0, parent.width - roleName.implicitWidth - parent.spacing)
+                      visible: messageCard.isTool
+                      text: root.toolSummary(messageCard.messageData, messageCard.toolExpanded)
+                      textFormat: Text.PlainText
+                      color: root.messageTextColor("Tool", String(messageCard.messageData.status || ""))
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  Repeater {
+                    model: messageCard.messageData.attachments || []
+                    delegate: Rectangle {
+                      width: Math.min(messageContent.width, attachmentText.implicitWidth + Style.space(14))
+                      height: Style.space(23)
+                      radius: Style.cornerRadius
+                      color: Style.normalFillFor(Color.popups.text, Color.accent)
+                      border.color: Style.normalBorderFor(Color.popups.text, Color.accent)
+                      border.width: 1
+                      Text {
+                        id: attachmentText
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.leftMargin: Style.space(7)
+                        anchors.rightMargin: Style.space(7)
+                        text: "[" + String(modelData.kind || "file") + "] " + String(modelData.label || "attachment")
+                        textFormat: Text.PlainText
+                        color: root.userAccent
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        elide: Text.ElideRight
+                      }
+                    }
+                  }
+
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(7)
+                    visible: !messageCard.isTool || messageCard.toolExpanded
+
+                    Text {
+                      width: parent.width
+                      visible: messageCard.messageIndex === root.assistantDraftIndex
+                      text: root.assistantVisibleText + " |"
+                      textFormat: Text.PlainText
+                      color: root.messageTextColor(messageCard.messageRole, String(messageCard.messageData.status || ""))
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                      wrapMode: Text.Wrap
+                    }
+
+                    Repeater {
+                      model: messageCard.messageIndex === root.assistantDraftIndex ? [] : root.messageBlocks(messageCard.messageData, messageCard.messageIndex)
+                      delegate: Column {
+                        id: blockDelegate
+                        property var block: modelData
+                        width: parent.width
+                        spacing: Style.space(5)
+
+                        Text {
+                          width: parent.width
+                          visible: blockDelegate.block.kind === "text" && blockDelegate.block.text !== ""
+                          text: blockDelegate.block.text
+                          textFormat: messageCard.messageRole === "AI" ? Text.MarkdownText : Text.PlainText
+                          color: root.messageTextColor(messageCard.messageRole, String(messageCard.messageData.status || ""))
+                          linkColor: root.roleColor(messageCard.messageRole, String(messageCard.messageData.status || ""))
+                          font.family: Style.font.family
+                          font.pixelSize: messageCard.isTool ? Style.font.caption : Style.font.body
+                          wrapMode: Text.Wrap
+                        }
+
+                        Flickable {
+                          id: tableScroll
+                          width: parent.width
+                          height: visible ? tableGrid.implicitHeight : 0
+                          visible: blockDelegate.block.kind === "table"
+                          contentWidth: Math.max(width, tableGrid.width)
+                          contentHeight: tableGrid.implicitHeight
+                          clip: true
+                          boundsBehavior: Flickable.StopAtBounds
+                          flickableDirection: Flickable.HorizontalFlick
+                          interactive: contentWidth > width
+                          ScrollBar.horizontal: ScrollBar { policy: tableScroll.contentWidth > tableScroll.width ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff }
+
+                          Column {
+                            id: tableGrid
+                            width: root.tableWidth(blockDelegate.block)
+                            spacing: 0
+                            Repeater {
+                              model: root.tableDisplayRows(blockDelegate.block)
+                              delegate: Row {
+                                id: tableRow
+                                property var rowData: modelData
+                                spacing: 0
+                                Repeater {
+                                  model: tableRow.rowData.cells || []
+                                  delegate: Rectangle {
+                                    width: root.tableColumnWidth(blockDelegate.block, index)
+                                    height: Math.max(Style.space(30), cellText.implicitHeight + Style.space(12))
+                                    color: tableRow.rowData.header ? Style.selectedFillFor(Color.popups.text, Color.accent) : Style.normalFillFor(Color.popups.text, Color.accent)
+                                    border.color: tableRow.rowData.header ? Style.selectedBorderFor(Color.popups.text, Color.accent) : Style.normalBorderFor(Color.popups.text, Color.accent)
+                                    border.width: 1
+                                    Text {
+                                      id: cellText
+                                      anchors.left: parent.left
+                                      anchors.right: parent.right
+                                      anchors.verticalCenter: parent.verticalCenter
+                                      anchors.leftMargin: Style.space(7)
+                                      anchors.rightMargin: Style.space(7)
+                                      text: String(modelData || "")
+                                      textFormat: Text.PlainText
+                                      color: tableRow.rowData.header ? root.aiAccent : Color.popups.text
+                                      font.family: Style.font.family
+                                      font.pixelSize: Style.font.caption
+                                      font.bold: tableRow.rowData.header
+                                      wrapMode: Text.Wrap
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
                   }
                 }
-                Text {
+
+                MouseArea {
+                  anchors.fill: parent
+                  enabled: messageCard.isTool
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: messageCard.toolExpanded = !messageCard.toolExpanded
+                }
+              }
+              footer: Item {
+                width: transcript.width
+                height: thinkingCard.visible ? thinkingCard.height + Style.space(8) : 0
+                visible: height > 0
+
+                Rectangle {
+                  id: thinkingCard
                   width: parent.width
-                  text: modelData.text + (modelData.streaming ? " |" : "")
-                  textFormat: Text.PlainText
-                  color: modelData.role === "Tool" && modelData.status === "error" ? Color.urgent : Color.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: modelData.role === "Tool" ? Style.font.caption : Style.font.body
-                  wrapMode: Text.Wrap
-                  visible: modelData.text !== "" || modelData.streaming
+                  height: Style.space(58)
+                  visible: root.sending && root.assistantDraftIndex < 0
+                  radius: Style.cornerRadius
+                  color: Style.selectedFillFor(Color.popups.text, Color.accent)
+                  border.color: Style.normalBorderFor(Color.popups.text, Color.accent)
+                  border.width: 1
+
+                  SequentialAnimation on opacity {
+                    running: thinkingCard.visible
+                    loops: Animation.Infinite
+                    NumberAnimation { to: 0.78; duration: 720; easing.type: Easing.InOutSine }
+                    NumberAnimation { to: 1.0; duration: 720; easing.type: Easing.InOutSine }
+                  }
+
+                  Row {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    spacing: Style.space(10)
+
+                    Rectangle {
+                      id: logoBadge
+                      width: Style.space(104)
+                      height: Style.space(34)
+                      anchors.verticalCenter: parent.verticalCenter
+                      radius: Math.round(height / 2)
+                      color: root.aiAccent
+                      border.color: Style.normalBorderFor(Color.popups.text, Color.accent)
+                      border.width: 1
+                      clip: true
+
+                      SequentialAnimation on scale {
+                        running: thinkingCard.visible
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1.05; duration: 680; easing.type: Easing.InOutSine }
+                        NumberAnimation { to: 1.0; duration: 680; easing.type: Easing.InOutSine }
+                      }
+
+                      Image {
+                        anchors.centerIn: parent
+                        width: Style.space(86)
+                        height: Style.space(20)
+                        source: root.omarchyLogoSource
+                        fillMode: Image.PreserveAspectFit
+                        smooth: true
+                        opacity: 0.82
+
+                        RotationAnimation on rotation {
+                          running: thinkingCard.visible
+                          loops: Animation.Infinite
+                          from: 0
+                          to: 360
+                          duration: 1450
+                        }
+                      }
+                    }
+
+                    Column {
+                      width: parent.width - logoBadge.width - thinkingDots.width - parent.spacing * 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(2)
+                      Text {
+                        width: parent.width
+                        text: "Omarchy is thinking"
+                        textFormat: Text.PlainText
+                        color: root.aiAccent
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        width: parent.width
+                        text: "Preparing the next tokens"
+                        textFormat: Text.PlainText
+                        color: Color.muted
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    Row {
+                      id: thinkingDots
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(4)
+                      Repeater {
+                        model: 3
+                        delegate: Rectangle {
+                          width: Style.space(7)
+                          height: width
+                          radius: width / 2
+                          color: root.aiAccent
+                          opacity: 0.28
+                          SequentialAnimation on opacity {
+                            running: thinkingCard.visible
+                            loops: Animation.Infinite
+                            PauseAnimation { duration: index * 140 }
+                            NumberAnimation { to: 1.0; duration: 260; easing.type: Easing.OutQuad }
+                            NumberAnimation { to: 0.28; duration: 420; easing.type: Easing.InOutSine }
+                            PauseAnimation { duration: 360 }
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
               }
               Text {
@@ -1598,8 +2373,10 @@ Panel {
               Repeater {
                 model: root.attachments
                 delegate: Button {
-                  text: modelData.kind.toUpperCase() + " " + modelData.label
+                  text: String(modelData.kind || "file").toUpperCase() + " " + String(modelData.label || "attachment")
                   bordered: true
+                  foreground: Color.popups.text
+                  accent: Color.accent
                   tooltipText: "Click to remove"
                   onClicked: root.removeAttachment(index)
                 }
@@ -1618,9 +2395,9 @@ Panel {
               }
               Button {
                 id: addAttachmentButton
-                text: "Add file"
+                text: attachmentField.text.trim() === "" ? "Browse" : "Add file"
                 bordered: true
-                enabled: attachmentField.enabled && attachmentField.text.trim() !== ""
+                enabled: attachmentField.enabled
                 onClicked: root.addAttachment()
               }
             }
@@ -1631,16 +2408,28 @@ Panel {
               spacing: Style.space(8)
               TextField {
                 id: input
-                width: parent.width - sendButton.width - parent.spacing
+                width: parent.width - sendButton.width
+                  - (stopButton.visible ? stopButton.width + parent.spacing : 0)
+                  - parent.spacing
                 placeholderText: root.ready ? "Message" : "Load models in Setup..."
                 enabled: root.ready && !root.sending && root.selectedModel !== ""
                 onAccepted: root.sendMessage()
               }
               Button {
                 id: sendButton
-                text: root.sending ? "Thinking..." : "Send"
+                text: "Send"
                 enabled: input.enabled && (input.text.trim() !== "" || root.attachments.length > 0)
                 onClicked: root.sendMessage()
+              }
+              Button {
+                id: stopButton
+                text: "Stop"
+                bordered: true
+                visible: root.sending
+                enabled: root.sending
+                foreground: Color.urgent
+                accent: Color.urgent
+                onClicked: root.stopResponse()
               }
             }
           }
@@ -1648,4 +2437,5 @@ Panel {
       }
     }
   }
+}
 }

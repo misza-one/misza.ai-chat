@@ -13,6 +13,7 @@ import select
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -24,6 +25,9 @@ sys.dont_write_bytecode = True
 CLIENT_INFO = {"name": "misza.ai-chat", "version": "1.0.0"}
 MCP_PROTOCOL_VERSION = "2024-11-05"
 REQUEST_TIMEOUT = 20
+CHAT_RETRY_DELAYS = [1.0, 2.0, 4.0]
+RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+OPENROUTER_REASONING_EFFORTS = ["max", "xhigh", "high", "medium", "low", "minimal", "none"]
 MAX_TOOL_ROUNDS = 12
 MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 MAX_TEXT_ATTACHMENT_CHARS = 180000
@@ -40,6 +44,7 @@ XAI_DEVICE_URL = "https://auth.x.ai/oauth2/device/code"
 XAI_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 XAI_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 OAUTH_REFRESH_SKEW_MS = 120000
+EMIT_LOCK = threading.Lock()
 
 OPENAI_PLAN_MODELS = [
     "gpt-5.6-sol",
@@ -210,11 +215,207 @@ MCP_CONFIG_CANDIDATES = [
 ]
 
 
+class ProviderRequestError(RuntimeError):
+    def __init__(self, message, debug=None, status=0, retryable=False, retry_after=0):
+        super().__init__(message)
+        self.debug = debug or {}
+        self.status = int(status or 0)
+        self.retryable = bool(retryable)
+        self.retry_after = float(retry_after or 0)
+
+
+class ChatCancelled(RuntimeError):
+    pass
+
+
 def emit(payload):
-    print(json.dumps(payload, separators=(",", ":")), flush=True)
+    with EMIT_LOCK:
+        print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+
+def clipped(value, limit=4000):
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n[truncated " + str(len(text) - limit) + " chars]"
+
+
+def redact_debug_text(value):
+    text = str(value or "")
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(access[_-]?token[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(refresh[_-]?token[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+", r"\1[redacted]", text)
+    return text
+
+
+def safe_url(url):
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        query = "?..." if parsed.query else ""
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
+    except Exception:
+        return clipped(redact_debug_text(url), 600)
+
+
+def safe_headers(headers):
+    out = {}
+    for key, value in dict(headers or {}).items():
+        lower = str(key).lower()
+        if lower in ("authorization", "cookie", "set-cookie", "x-api-key", "api-key"):
+            out[str(key)] = "[redacted]"
+        else:
+            out[str(key)] = clipped(redact_debug_text(value), 400)
+    return out
+
+
+def payload_summary(payload):
+    if not isinstance(payload, dict):
+        return {"type": type(payload).__name__}
+    summary = {}
+    if payload.get("model") is not None:
+        summary["model"] = str(payload.get("model", ""))
+    if payload.get("thinkingLevel"):
+        summary["thinkingLevel"] = str(payload.get("thinkingLevel", ""))
+    if isinstance(payload.get("reasoning"), dict):
+        reasoning = payload.get("reasoning") or {}
+        summary["reasoning"] = {key: reasoning.get(key) for key in ("effort", "enabled", "exclude", "mode", "context") if reasoning.get(key) is not None}
+        if reasoning.get("max_tokens") is not None:
+            summary["reasoning"]["max_tokens"] = reasoning.get("max_tokens")
+    if payload.get("reasoning_effort"):
+        summary["reasoning_effort"] = str(payload.get("reasoning_effort", ""))
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        summary["messages"] = len(messages)
+        summary["roles"] = [str(item.get("role", "")) for item in messages if isinstance(item, dict)][-8:]
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        summary["tools"] = len(tools)
+    if payload.get("tool_choice") is not None:
+        summary["toolChoice"] = str(payload.get("tool_choice", ""))
+    plugins = payload.get("plugins")
+    if isinstance(plugins, list):
+        summary["plugins"] = [str(item.get("id", "")) for item in plugins if isinstance(item, dict)]
+    return summary
+
+
+def response_error_message(raw):
+    text = str(raw or "")
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return clipped(redact_debug_text(text), 1200)
+    if not isinstance(parsed, dict):
+        return clipped(redact_debug_text(text), 1200)
+    detail = parsed.get("error", parsed)
+    if isinstance(detail, dict):
+        for key in ("message", "detail", "error_description", "code"):
+            if detail.get(key):
+                return clipped(redact_debug_text(detail.get(key)), 1200)
+        return clipped(redact_debug_text(json.dumps(detail, ensure_ascii=False)), 1200)
+    return clipped(redact_debug_text(detail), 1200)
+
+
+def retry_after_seconds(headers):
+    headers = dict(headers or {})
+    value = headers.get("Retry-After") or headers.get("retry-after") or ""
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return 0.0
+
+
+def rate_limit_hint(headers):
+    headers = dict(headers or {})
+    limit = headers.get("X-RateLimit-Limit") or headers.get("x-ratelimit-limit") or ""
+    remaining = headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining") or ""
+    reset = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset") or ""
+    retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+    parts = []
+    if limit:
+        parts.append("limit " + str(limit))
+    if remaining:
+        parts.append("remaining " + str(remaining))
+    if reset:
+        parts.append("reset " + str(reset))
+    if retry_after:
+        parts.append("retry after " + str(retry_after) + "s")
+    return "; ".join(parts)
+
+
+def provider_debug(context, method, url, payload, request_headers, status=0, reason="", response_headers=None, body="", error_type=""):
+    ctx = context or {}
+    debug = {
+        "provider": ctx.get("providerLabel") or ctx.get("providerId") or "Provider",
+        "providerId": ctx.get("providerId") or "",
+        "authMode": ctx.get("authMode") or "",
+        "method": method,
+        "url": safe_url(url),
+        "status": int(status or 0),
+        "reason": clipped(redact_debug_text(reason), 300),
+        "errorType": error_type,
+        "request": {
+            "headers": safe_headers(request_headers),
+            "payload": payload_summary(payload),
+        },
+        "response": {
+            "headers": safe_headers(response_headers),
+            "body": clipped(redact_debug_text(body), 4000),
+        },
+    }
+    return debug
+
+
+def provider_error_from_http(error, method, url, payload, request_headers, context=None):
+    try:
+        body = error.read().decode("utf-8", "replace")
+    except Exception:
+        body = ""
+    status = int(getattr(error, "code", 0) or 0)
+    reason = str(getattr(error, "reason", "") or getattr(error, "msg", "") or "HTTP error")
+    message = response_error_message(body) or reason
+    provider = (context or {}).get("providerLabel") or (context or {}).get("providerId") or "Provider"
+    display = provider + " returned " + str(status) + " " + reason + (": " + message if message else "")
+    headers = dict(getattr(error, "headers", {}) or {})
+    hint = rate_limit_hint(headers) if status == 429 else ""
+    if hint:
+        display += " (" + hint + ")"
+    return ProviderRequestError(
+        display,
+        provider_debug(context, method, url, payload, request_headers, status, reason, headers, body, "HTTPError"),
+        status=status,
+        retryable=status in RETRYABLE_HTTP_STATUSES,
+        retry_after=retry_after_seconds(headers),
+    )
+
+
+def provider_error_from_exception(error, method, url, payload, request_headers, context=None):
+    provider = (context or {}).get("providerLabel") or (context or {}).get("providerId") or "Provider"
+    reason = compact_error(error)
+    return ProviderRequestError(
+        provider + " request failed: " + reason,
+        provider_debug(context, method, url, payload, request_headers, 0, reason, {}, "", type(error).__name__),
+        retryable=True,
+    )
+
+
+def check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ChatCancelled("Stopped by user.")
+
+
+def sleep_with_cancel(seconds, cancel_event):
+    deadline = time.monotonic() + max(0.0, float(seconds or 0))
+    while time.monotonic() < deadline:
+        check_cancel(cancel_event)
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
 def compact_error(error):
+    if isinstance(error, ProviderRequestError):
+        return str(error)
+    if isinstance(error, ChatCancelled):
+        return "Stopped by user."
     if isinstance(error, urllib.error.HTTPError):
         try:
             body = error.read().decode("utf-8", "replace")
@@ -229,7 +430,19 @@ def compact_error(error):
     return str(error)
 
 
-def json_request(url, method="GET", payload=None, headers=None, timeout=REQUEST_TIMEOUT):
+def error_event(operation, error):
+    payload = {"type": "error", "op": operation, "message": compact_error(error)}
+    if isinstance(error, ProviderRequestError):
+        payload["debug"] = error.debug
+        payload["retryable"] = error.retryable
+        payload["status"] = error.status
+        if error.retry_after:
+            payload["retryAfter"] = error.retry_after
+    return payload
+
+
+def json_request(url, method="GET", payload=None, headers=None, timeout=REQUEST_TIMEOUT, context=None, cancel_event=None):
+    check_cancel(cancel_event)
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request_headers = {"Accept": "application/json"}
     if payload is not None:
@@ -237,15 +450,38 @@ def json_request(url, method="GET", payload=None, headers=None, timeout=REQUEST_
     if headers:
         request_headers.update(headers)
     request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8", "replace")
-        return json.loads(raw) if raw else {}, dict(response.headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            check_cancel(cancel_event)
+            raw = response.read().decode("utf-8", "replace")
+            check_cancel(cancel_event)
+            try:
+                return json.loads(raw) if raw else {}, dict(response.headers)
+            except json.JSONDecodeError as error:
+                if context:
+                    raise ProviderRequestError(
+                        str(context.get("providerLabel") or context.get("providerId") or "Provider") + " returned invalid JSON.",
+                        provider_debug(context, method, url, payload, request_headers, response.status,
+                                       "Invalid JSON: " + str(error), dict(response.headers), raw, "JSONDecodeError"),
+                        status=int(getattr(response, "status", 0) or 0),
+                    )
+                raise
+    except urllib.error.HTTPError as error:
+        if context:
+            raise provider_error_from_http(error, method, url, payload, request_headers, context) from None
+        raise
+    except (TimeoutError, urllib.error.URLError, OSError) as error:
+        if context:
+            raise provider_error_from_exception(error, method, url, payload, request_headers, context) from None
+        raise
 
 
-def sse_events(response):
+def sse_events(response, cancel_event=None):
     event_type = ""
     data_lines = []
+    check_cancel(cancel_event)
     for raw_line in response:
+        check_cancel(cancel_event)
         line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
         if line == "":
             if data_lines:
@@ -260,7 +496,8 @@ def sse_events(response):
         yield event_type, "\n".join(data_lines)
 
 
-def stream_json_request(url, payload, headers=None, timeout=REQUEST_TIMEOUT, on_delta=None):
+def stream_json_request(url, payload, headers=None, timeout=REQUEST_TIMEOUT, on_delta=None, context=None, cancel_event=None):
+    check_cancel(cancel_event)
     data = json.dumps(payload).encode("utf-8")
     request_headers = {
         "Accept": "text/event-stream",
@@ -269,8 +506,20 @@ def stream_json_request(url, payload, headers=None, timeout=REQUEST_TIMEOUT, on_
     if headers:
         request_headers.update(headers)
     request = urllib.request.Request(url, data=data, headers=request_headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return parse_stream_events(sse_events(response), on_delta=on_delta), dict(response.headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            check_cancel(cancel_event)
+            return parse_stream_events(sse_events(response, cancel_event), on_delta=on_delta,
+                                       context=context, url=url, payload=payload,
+                                       headers=request_headers, cancel_event=cancel_event), dict(response.headers)
+    except urllib.error.HTTPError as error:
+        if context:
+            raise provider_error_from_http(error, "POST", url, payload, request_headers, context) from None
+        raise
+    except (TimeoutError, urllib.error.URLError, OSError) as error:
+        if context:
+            raise provider_error_from_exception(error, "POST", url, payload, request_headers, context) from None
+        raise
 
 
 def form_request(url, payload, headers=None, timeout=REQUEST_TIMEOUT):
@@ -499,6 +748,20 @@ def open_url(url):
     if not url:
         raise ValueError("This provider has no configured URL.")
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def pick_files():
+    extensions = "png jpg jpeg webp gif bmp heic avif mp4 mov webm mkv avi m4v mp3 wav m4a flac ogg pdf txt md json csv log yaml yml"
+    result = subprocess.run(
+        ["omarchy", "file", "select", "--title", "Attach files", "--multiple", "--extensions", extensions],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 and not files and result.stderr.strip():
+        raise RuntimeError(result.stderr.strip())
+    return files
 
 
 def parse_local_redirect_uri(redirect_uri):
@@ -976,7 +1239,20 @@ def text_from_file(path):
     return text
 
 
-def content_from_prompt(prompt, attachments):
+def source_filename(source):
+    text = str(source or "")
+    if text.startswith("http://") or text.startswith("https://"):
+        path = urllib.parse.urlparse(text).path
+        name = os.path.basename(urllib.parse.unquote(path))
+        return name or "attachment"
+    return os.path.basename(os.path.abspath(os.path.expanduser(text))) or "attachment"
+
+
+def openrouter_file_part(source, file_data):
+    return {"type": "file", "file": {"filename": source_filename(source), "file_data": file_data}}
+
+
+def content_from_prompt(prompt, attachments, provider_id=""):
     items = [{"type": "text", "text": prompt}]
     for attachment in attachments:
         source = str(attachment.get("source", attachment.get("path", ""))).strip()
@@ -984,6 +1260,7 @@ def content_from_prompt(prompt, attachments):
             continue
         mime = str(attachment.get("mime", "") or guess_mime(source))
         kind = attachment_kind(source, mime)
+        is_pdf = mime == "application/pdf" or source.lower().split("?", 1)[0].endswith(".pdf")
         if source.startswith("http://") or source.startswith("https://"):
             url = source
         else:
@@ -994,6 +1271,9 @@ def content_from_prompt(prompt, attachments):
                 items.append({"type": "text", "text": "Attached file " + os.path.basename(path) + ":\n" + text_from_file(path)})
                 continue
             url = data_url_for_file(path, mime)
+        if provider_id == "openrouter" and is_pdf:
+            items.append(openrouter_file_part(source, url))
+            continue
         if kind == "image":
             items.append({"type": "image_url", "image_url": {"url": url}})
         elif kind == "video":
@@ -1007,9 +1287,25 @@ def content_from_prompt(prompt, attachments):
 
 
 def message_from_completion_response(response):
+    if not isinstance(response, dict):
+        return {}
+    if response.get("role") and ("content" in response or "tool_calls" in response):
+        return response
+    if isinstance(response.get("message"), dict):
+        return response["message"]
     choices = response.get("choices", [])
     if choices:
-        return choices[0].get("message", {})
+        choice = choices[0]
+        if isinstance(choice, dict):
+            message = choice.get("message")
+            if isinstance(message, dict):
+                return message
+            if choice.get("text") is not None:
+                return {"role": "assistant", "content": str(choice.get("text", ""))}
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                return {"role": "assistant", "content": str(delta.get("content", ""))}
+        return {}
     output = response.get("output", [])
     if isinstance(output, list):
         texts = []
@@ -1093,7 +1389,7 @@ def first_present(*values):
     return ""
 
 
-def parse_stream_events(events, on_delta=None):
+def parse_stream_events(events, on_delta=None, context=None, url="", payload=None, headers=None, cancel_event=None):
     texts = []
     response_items = []
     chat_calls = {}
@@ -1111,6 +1407,7 @@ def parse_stream_events(events, on_delta=None):
             on_delta(text)
 
     for event_type, data in events:
+        check_cancel(cancel_event)
         if data == "[DONE]":
             break
         try:
@@ -1120,11 +1417,36 @@ def parse_stream_events(events, on_delta=None):
         if not isinstance(event, dict):
             continue
         kind = str(event.get("type") or event_type or "")
+        event_error = event.get("error")
+        if isinstance(event_error, dict) and any(isinstance(choice, dict) and choice.get("finish_reason") == "error"
+                                                for choice in event.get("choices", []) or []):
+            code = int(event_error.get("code", 0) or 0)
+            message = str(event_error.get("message", event_error))
+            if context:
+                provider = str(context.get("providerLabel") or context.get("providerId") or "Provider")
+                raise ProviderRequestError(
+                    provider + " stream error" + (" " + str(code) if code else "") + ": " + clipped(redact_debug_text(message), 1200),
+                    provider_debug(context, "POST", url, payload, headers, code, message, {},
+                                   json.dumps(event, ensure_ascii=False), "StreamError"),
+                    status=code,
+                    retryable=code in RETRYABLE_HTTP_STATUSES,
+                )
+            raise RuntimeError(message)
         if kind == "error" or kind.endswith(".failed"):
             detail = event.get("error", event)
             if isinstance(detail, dict):
-                raise RuntimeError(str(detail.get("message", detail)))
-            raise RuntimeError(str(detail))
+                message = str(detail.get("message", detail))
+            else:
+                message = str(detail)
+            if context:
+                provider = str(context.get("providerLabel") or context.get("providerId") or "Provider")
+                raise ProviderRequestError(
+                    provider + " stream error: " + clipped(redact_debug_text(message), 1200),
+                    provider_debug(context, "POST", url, payload, headers, 0, message, {},
+                                   json.dumps(event, ensure_ascii=False), "StreamError"),
+                    retryable=True,
+                )
+            raise RuntimeError(message)
         if "choices" in event:
             for choice in event.get("choices", []) or []:
                 delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
@@ -1276,8 +1598,64 @@ def response_payload_from_chat_payload(payload, tools, stream=False):
     return result
 
 
-def thinking_level_rows(values):
-    return [{"value": "default", "label": "Default"}] + [{"value": value, "label": value} for value in values]
+def message_has_openrouter_file(messages):
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "file":
+                return True
+    return False
+
+
+def chat_completion_payload_for_provider(provider_id, payload):
+    result = dict(payload or {})
+    effort = str(result.pop("thinkingLevel", "") or "").strip()
+    if effort and effort not in ("default", "auto", "off"):
+        if provider_id == "openrouter":
+            result["reasoning"] = {"effort": effort}
+        elif provider_id in ("openai", "xai"):
+            result["reasoning_effort"] = effort
+    if provider_id == "openrouter" and message_has_openrouter_file(result.get("messages", [])):
+        plugins = [plugin for plugin in result.get("plugins", []) if isinstance(plugin, dict)] if isinstance(result.get("plugins"), list) else []
+        if not any(plugin.get("id") == "file-parser" for plugin in plugins):
+            plugins.append({"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}})
+        result["plugins"] = plugins
+    return result
+
+
+def thinking_level_rows(values, default_value="", mandatory=False):
+    seen = set()
+    rows = []
+    for value in values:
+        value = str(value or "").strip()
+        if not value or value in seen or value == "default" or (mandatory and value == "none"):
+            continue
+        seen.add(value)
+        rows.append({"value": value, "label": value})
+    if not rows:
+        return []
+    label = "Default" + (" (" + default_value + ")" if default_value else "")
+    return [{"value": "default", "label": label}] + rows
+
+
+def thinking_levels_from_reasoning(reasoning):
+    if not isinstance(reasoning, dict):
+        return []
+    default_effort = str(reasoning.get("default_effort", "") or "").strip()
+    mandatory = bool(reasoning.get("mandatory"))
+    if "supported_efforts" in reasoning:
+        supported = reasoning.get("supported_efforts")
+        if supported is None:
+            return thinking_level_rows(OPENROUTER_REASONING_EFFORTS, default_effort, mandatory)
+        if isinstance(supported, list):
+            return thinking_level_rows(supported, default_effort, mandatory)
+    if default_effort:
+        return thinking_level_rows([default_effort], default_effort, mandatory)
+    return []
 
 
 def gpt5_version(model_id):
@@ -1285,8 +1663,12 @@ def gpt5_version(model_id):
     return int(match.group(1)) if match else None
 
 
-def thinking_levels(provider_id, model_id):
+def thinking_levels(provider_id, model_id, metadata=None):
     lower = str(model_id or "").lower()
+    if provider_id == "openrouter" and isinstance(metadata, dict):
+        rows = thinking_levels_from_reasoning(metadata.get("reasoning"))
+        if rows:
+            return rows
     if provider_id == "openai" and re.search(r"(?:^|/)gpt-5(?:[.-]|$)", lower):
         version = gpt5_version(lower)
         if "-chat" in lower:
@@ -1310,12 +1692,32 @@ def thinking_levels(provider_id, model_id):
     return []
 
 
-def model_capabilities(provider_id, model_id):
+def model_capabilities(provider_id, model_id, metadata=None):
     lower = str(model_id or "").lower()
+    if provider_id == "openrouter" and isinstance(metadata, dict):
+        architecture = metadata.get("architecture", {}) if isinstance(metadata.get("architecture", {}), dict) else {}
+        input_modalities = {str(item).lower() for item in architecture.get("input_modalities", []) if item}
+        output_modalities = {str(item).lower() for item in architecture.get("output_modalities", []) if item}
+        supported_parameters = {str(item) for item in metadata.get("supported_parameters", []) if item}
+        return {
+            "toolCalls": "tools" in supported_parameters,
+            "toolChoice": "tool_choice" in supported_parameters,
+            "image": "image" in input_modalities,
+            "video": "video" in input_modalities,
+            "audio": "audio" in input_modalities,
+            "files": True,
+            "outputImage": "image" in output_modalities,
+            "outputAudio": "audio" in output_modalities or "speech" in output_modalities,
+            "outputVideo": "video" in output_modalities,
+            "contextLength": metadata.get("context_length", 0) or 0,
+            "supportedParameters": sorted(supported_parameters),
+            "thinkingLevels": thinking_levels(provider_id, lower, metadata),
+        }
     image = provider_id in ("openai", "xai", "openrouter") or any(token in lower for token in ("vision", "vl", "image", "gpt-4o"))
     video = provider_id == "xai" and "video" in lower
     return {
         "toolCalls": True,
+        "toolChoice": True,
         "image": image,
         "video": video,
         "audio": provider_id in ("openai", "openrouter") and any(token in lower for token in ("audio", "gpt-4o")),
@@ -1324,8 +1726,25 @@ def model_capabilities(provider_id, model_id):
     }
 
 
-def model_row(provider_id, model_id):
-    return {"id": model_id, "label": model_id, "capabilities": model_capabilities(provider_id, model_id)}
+def model_row(provider_id, model_id, metadata=None):
+    row = {"id": model_id, "label": model_id, "capabilities": model_capabilities(provider_id, model_id, metadata)}
+    if isinstance(metadata, dict):
+        name = str(metadata.get("name", "") or "")
+        description = []
+        if name and name != model_id:
+            description.append(name)
+        context_length = metadata.get("context_length", 0) or 0
+        if context_length:
+            description.append(str(context_length) + " ctx")
+        reasoning = metadata.get("reasoning")
+        if isinstance(reasoning, dict):
+            if reasoning.get("mandatory"):
+                description.append("reasoning required")
+            elif reasoning.get("default_enabled"):
+                description.append("reasoning default")
+        if description:
+            row["description"] = " / ".join(description)
+    return row
 
 
 def provider_auth_status(provider, opencode_auth):
@@ -1336,7 +1755,7 @@ def provider_auth_status(provider, opencode_auth):
     if oauth.get("kind", "").startswith("opencode-"):
         return "signed in with OpenCode" if isinstance(auth, dict) and auth.get("type") == "oauth" else "not signed in"
     if oauth.get("kind") == "openrouter" and base_url and lookup_secret(base_url):
-        return "OAuth key saved"
+        return "API key saved"
     if provider.get("defaultAuthMode") == "none":
         return "no auth"
     if base_url and lookup_secret(base_url):
@@ -1482,6 +1901,11 @@ class Bridge:
         self.current_title = ""
         self.mcp_clients = {}
         self.tool_map = {}
+        self.model_capabilities = {}
+        self.chat_thread = None
+        self.chat_cancel = None
+        self.chat_token = ""
+        self.chat_state_lock = threading.Lock()
 
     def discover(self):
         profiles = []
@@ -1552,48 +1976,71 @@ class Bridge:
         emit({"type": "connected", "baseUrl": self.base_url, "providerId": self.provider_id,
               "authMode": self.auth_mode, "model": self.model, "models": models, "mcp": statuses})
 
+    def provider_context(self):
+        provider = provider_by_id(self.provider_id)
+        return {
+            "providerId": self.provider_id,
+            "providerLabel": provider.get("label", self.provider_id or "Provider"),
+            "authMode": self.auth_mode,
+        }
+
     def fetch_models(self):
         if not self.base_url:
             raise ValueError("Enter an OpenAI-compatible endpoint.")
         if self.auth_mode == "oauth" and self.provider_id == "openai":
             get_opencode_oauth("openai")
-            return [model_row("openai", model) for model in opencode_models("openai", OPENAI_PLAN_MODELS)]
+            choices = [model_row("openai", model) for model in opencode_models("openai", OPENAI_PLAN_MODELS)]
+            self.model_capabilities = {item["id"]: item.get("capabilities", {}) for item in choices}
+            return choices
         if self.auth_mode == "oauth" and self.provider_id == "xai":
             get_opencode_oauth("xai")
-            return [model_row("xai", model) for model in opencode_models("xai", XAI_PLAN_MODELS)]
+            choices = [model_row("xai", model) for model in opencode_models("xai", XAI_PLAN_MODELS)]
+            self.model_capabilities = {item["id"]: item.get("capabilities", {}) for item in choices}
+            return choices
         models, _ = self.api_request("GET", "/models")
         choices = []
         for item in models.get("data", []):
+            if not isinstance(item, dict):
+                continue
             model_id = str(item.get("id", ""))
             if model_id:
-                choices.append(model_row(self.provider_id, model_id))
+                choices.append(model_row(self.provider_id, model_id, item))
         if not choices and self.model:
             choices.append(model_row(self.provider_id, self.model))
         if not choices:
             raise RuntimeError("The endpoint returned no models.")
         if self.model not in [item["id"] for item in choices]:
             self.model = choices[0]["id"]
+        self.model_capabilities = {item["id"]: item.get("capabilities", {}) for item in choices}
         return choices
 
-    def api_request(self, method, path, payload=None, on_delta=None):
+    def current_model_capabilities(self):
+        capabilities = self.model_capabilities.get(self.model)
+        return capabilities if isinstance(capabilities, dict) else model_capabilities(self.provider_id, self.model)
+
+    def api_request(self, method, path, payload=None, on_delta=None, cancel_event=None):
         headers = {}
         if self.auth_mode == "oauth" and self.provider_id == "openai":
-            return self.openai_plan_request(method, path, payload, on_delta=on_delta)
+            return self.openai_plan_request(method, path, payload, on_delta=on_delta, cancel_event=cancel_event)
         if self.auth_mode == "oauth" and self.provider_id == "xai":
             auth = get_opencode_oauth("xai")
             headers["Authorization"] = "Bearer " + auth["access"]
             headers["User-Agent"] = opencode_user_agent()
             if method == "POST" and path == "/chat/completions":
                 tools = self.openai_tools()
-                return json_request(self.base_url + "/responses", "POST", response_payload_from_chat_payload(payload or {}, tools), headers)
+                return json_request(self.base_url + "/responses", "POST",
+                                    response_payload_from_chat_payload(payload or {}, tools), headers,
+                                    context=self.provider_context(), cancel_event=cancel_event)
         api_key = lookup_secret(self.base_url) if self.auth_mode != "none" else ""
         if api_key and "Authorization" not in headers:
             headers["Authorization"] = "Bearer " + api_key
         if self.provider_id == "openrouter":
-            headers["X-Title"] = "misza.ai-chat"
-        return json_request(self.base_url + path, method, payload, headers)
+            headers["X-OpenRouter-Title"] = "misza.ai-chat"
+        request_payload = chat_completion_payload_for_provider(self.provider_id, payload) if method == "POST" and path == "/chat/completions" else payload
+        return json_request(self.base_url + path, method, request_payload, headers,
+                            context=self.provider_context(), cancel_event=cancel_event)
 
-    def openai_plan_request(self, method, path, payload=None, on_delta=None):
+    def openai_plan_request(self, method, path, payload=None, on_delta=None, cancel_event=None):
         if method == "GET" and path == "/models":
             return {"data": [{"id": model} for model in opencode_models("openai", OPENAI_PLAN_MODELS)]}, {}
         if method != "POST" or path not in ("/chat/completions", "/responses"):
@@ -1612,7 +2059,26 @@ class Bridge:
         tools = self.openai_tools()
         return stream_json_request(OPENAI_CODEX_ENDPOINT,
                                    response_payload_from_chat_payload(payload or {}, tools, stream=True),
-                                   headers, on_delta=on_delta)
+                                   headers, on_delta=on_delta, context=self.provider_context(),
+                                   cancel_event=cancel_event)
+
+    def chat_request_with_retries(self, payload, on_delta, can_retry, cancel_event):
+        max_attempts = len(CHAT_RETRY_DELAYS) + 1
+        attempt = 1
+        while True:
+            check_cancel(cancel_event)
+            try:
+                return self.api_request("POST", "/chat/completions", payload,
+                                        on_delta=on_delta, cancel_event=cancel_event)
+            except ProviderRequestError as error:
+                if attempt >= max_attempts or not error.retryable or not can_retry():
+                    raise
+                delay = max(CHAT_RETRY_DELAYS[attempt - 1], error.retry_after)
+                delay = min(delay, 12.0)
+                emit({"type": "chatRetry", "attempt": attempt + 1, "maxAttempts": max_attempts,
+                      "delay": delay, "message": str(error), "debug": error.debug})
+                sleep_with_cancel(delay, cancel_event)
+                attempt += 1
 
     def selected_mcp_configs(self):
         selected = {}
@@ -1780,32 +2246,89 @@ class Bridge:
         emit({"type": "chatReset"})
         self.emit_chats()
 
-    def chat(self, prompt, attachments, thinking_level=""):
+    def is_current_chat_token(self, token):
+        with self.chat_state_lock:
+            return self.chat_token == token
+
+    def start_chat(self, prompt, attachments, thinking_level="", retry=False):
+        with self.chat_state_lock:
+            if self.chat_thread and self.chat_thread.is_alive() and self.chat_cancel and not self.chat_cancel.is_set():
+                raise RuntimeError("A response is already in progress.")
+            cancel_event = threading.Event()
+            token = uuid.uuid4().hex
+            thread = threading.Thread(
+                target=self.chat_worker,
+                args=(token, cancel_event, prompt, attachments, thinking_level, retry),
+                daemon=True,
+            )
+            self.chat_cancel = cancel_event
+            self.chat_token = token
+            self.chat_thread = thread
+        thread.start()
+
+    def stop_chat(self):
+        with self.chat_state_lock:
+            active = self.chat_thread and self.chat_thread.is_alive() and self.chat_cancel
+            cancel_event = self.chat_cancel
+        if not active:
+            emit({"type": "notice", "message": "No response is running."})
+            return
+        cancel_event.set()
+        emit({"type": "chatStopped", "chatId": self.current_chat_id})
+
+    def chat_worker(self, token, cancel_event, prompt, attachments, thinking_level, retry):
+        try:
+            self.chat(prompt, attachments, thinking_level, append_user=not retry, cancel_event=cancel_event)
+        except ChatCancelled:
+            pass
+        except ProviderRequestError as error:
+            if not cancel_event.is_set() and self.is_current_chat_token(token):
+                emit(error_event("chat", error))
+        except Exception as error:
+            if not cancel_event.is_set() and self.is_current_chat_token(token):
+                emit(error_event("chat", error))
+        finally:
+            with self.chat_state_lock:
+                if self.chat_token == token:
+                    self.chat_thread = None
+                    self.chat_cancel = None
+                    self.chat_token = ""
+
+    def chat(self, prompt, attachments, thinking_level="", append_user=True, cancel_event=None):
         if not self.base_url or not self.model:
             raise ValueError("Connect an endpoint and select a model first.")
+        check_cancel(cancel_event)
         if thinking_level:
             self.thinking_level = str(thinking_level).strip()
-        summaries = [attachment_summary(item.get("source", item.get("path", "")), item.get("mime", ""))
-                     for item in attachments if isinstance(item, dict)]
-        if not self.current_chat_id:
-            self.current_chat_id = uuid.uuid4().hex
-            self.current_title = chat_title(prompt)
-        self.messages.append({"role": "user", "content": content_from_prompt(prompt, attachments)})
-        self.ui_messages.append({"role": "You", "text": prompt, "attachments": summaries})
+        if append_user:
+            summaries = [attachment_summary(item.get("source", item.get("path", "")), item.get("mime", ""))
+                         for item in attachments if isinstance(item, dict)]
+            if not self.current_chat_id:
+                self.current_chat_id = uuid.uuid4().hex
+                self.current_title = chat_title(prompt)
+            self.messages.append({"role": "user", "content": content_from_prompt(prompt, attachments, self.provider_id)})
+            self.ui_messages.append({"role": "You", "text": prompt, "attachments": summaries})
+        elif not self.messages or self.messages[-1].get("role") not in ("user", "tool"):
+            raise RuntimeError("There is no failed user message to retry.")
         for _ in range(MAX_TOOL_ROUNDS):
+            check_cancel(cancel_event)
             streamed = False
 
             def on_delta(text):
                 nonlocal streamed
+                check_cancel(cancel_event)
                 streamed = True
                 emit({"type": "chatDelta", "text": text, "chatId": self.current_chat_id})
 
             payload = {"model": self.model, "messages": self.messages, "thinkingLevel": self.thinking_level}
             tools = self.openai_tools()
-            if tools:
+            capabilities = self.current_model_capabilities()
+            if tools and capabilities.get("toolCalls", True):
                 payload["tools"] = tools
-                payload["tool_choice"] = "auto"
-            response, _ = self.api_request("POST", "/chat/completions", payload, on_delta=on_delta)
+                if capabilities.get("toolChoice", True):
+                    payload["tool_choice"] = "auto"
+            response, _ = self.chat_request_with_retries(payload, on_delta, lambda: not streamed, cancel_event)
+            check_cancel(cancel_event)
             message = message_from_completion_response(response)
             if not message:
                 raise RuntimeError("The endpoint returned no completion.")
@@ -1819,6 +2342,7 @@ class Bridge:
                 emit({"type": "chat", "text": text, "chatId": self.current_chat_id, "streamed": streamed})
                 return
             for call in calls:
+                check_cancel(cancel_event)
                 function = call.get("function", {})
                 name = function.get("name", "")
                 try:
@@ -1862,6 +2386,8 @@ def main():
                 provider = provider_by_id(str(command.get("providerId", "")))
                 open_url(provider.get("keyUrl", ""))
                 emit({"type": "notice", "message": "Opened API key page for " + provider.get("label", "provider") + "."})
+            elif operation == "pickFiles":
+                emit({"type": "filesPicked", "files": pick_files()})
             elif operation == "startOAuth":
                 provider = provider_by_id(str(command.get("providerId", "")))
                 oauth = provider.get("oauth", {}) if isinstance(provider.get("oauth", {}), dict) else {}
@@ -1882,13 +2408,17 @@ def main():
                     })
                     result = run_oauth_pkce(command)
                 else:
-                    raise ValueError("This provider has no built-in OAuth login flow.")
+                    raise ValueError("This provider has no built-in browser auth flow.")
                 emit({"type": "oauthSaved", "expiresIn": result.get("expiresIn", 0),
                       "tokenType": result.get("tokenType", "Bearer")})
             elif operation == "chat":
                 attachments = command.get("attachments", [])
-                bridge.chat(str(command.get("prompt", "")), attachments if isinstance(attachments, list) else [],
-                            str(command.get("thinkingLevel", "") or ""))
+                bridge.start_chat(str(command.get("prompt", "")), attachments if isinstance(attachments, list) else [],
+                                  str(command.get("thinkingLevel", "") or ""))
+            elif operation == "retry":
+                bridge.start_chat("", [], str(command.get("thinkingLevel", "") or ""), retry=True)
+            elif operation == "stop":
+                bridge.stop_chat()
             elif operation == "model":
                 bridge.model = str(command.get("model", "")).strip()
             elif operation == "thinking":
@@ -1908,7 +2438,7 @@ def main():
             else:
                 raise ValueError("Unknown bridge command.")
         except Exception as error:
-            emit({"type": "error", "op": operation, "message": compact_error(error)})
+            emit(error_event(operation, error))
     bridge.close_mcp()
 
 
